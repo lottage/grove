@@ -33,6 +33,7 @@ MAX_PENDING_REQUESTS = 3           # model requests a resident may have waiting 
 WISH_KINDS = (None, "wish", "model_request")      # lines of wishes.jsonl that are shown as wishes; the rest are decisions and receipts
 MAX_WEB_LOG = 40
 _JOURNAL_MARK = re.compile(r"^<!-- entry ts=([0-9.]+) session=([A-Za-z0-9_-]*) -->$", re.M)
+_JOURNAL_MARK_LINE = re.compile(r"^<!-- entry ts=", re.M)
 
 
 class StoreError(ValueError):
@@ -208,20 +209,32 @@ class Store:
             pass
 
     def append_journal(self, resident: str, session: str, text: str) -> None:
+        # An entry's text may hold lines that look like entry markers: a resident that reads its journal back and copies it
+        # into a reply (rc.8 dry run: the board showed every entry twice). They are defused so one write stays one entry.
+        body = _JOURNAL_MARK_LINE.sub(lambda m: "\\" + m.group(0), text.strip())
         with self.lock:
             with open(os.path.join(self.root(resident), "journal.md"), "a", encoding="utf-8", newline="\n") as f:
-                f.write("<!-- entry ts=%.3f session=%s -->\n%s\n\n" % (self.clock(), session, text.strip()))
+                f.write("<!-- entry ts=%.3f session=%s -->\n%s\n\n" % (self.clock(), session, body))
 
     def read_journal(self, resident: str) -> str:
         with open(os.path.join(self.root(resident), "journal.md"), encoding="utf-8") as f:
             return f.read()
 
     def journal_entries(self, resident: str) -> List[Dict[str, Any]]:
+        """The journal's entries in order. A marker that repeats an entry already seen (journals written before append_journal
+        defused them, where an echoed copy of earlier entries sits inside a later one) belongs to the entry before it."""
         text = self.read_journal(resident)
         marks = list(_JOURNAL_MARK.finditer(text))
-        out = []
+        out: List[Dict[str, Any]] = []
+        seen, last = set(), None
         for i, m in enumerate(marks):
             end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+            key = (m.group(1), m.group(2))
+            if key in seen and out and key != last:
+                out[-1]["text"] = (out[-1]["text"] + "\n\n" + text[m.start():end]).strip()
+                continue
+            seen.add(key)
+            last = key
             out.append({"ts": float(m.group(1)), "session": m.group(2), "text": text[m.end():end].strip()})
         return out
 

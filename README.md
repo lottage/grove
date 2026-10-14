@@ -65,7 +65,8 @@ iptables on the host is not where Docker Desktop on Windows or macOS filters con
 and the internal networks hold. If the residents matter to you and you want the strongest separation, run the worker and the reader
 on their own machines (the pieces take plain environment variables), with the firewall on the router or the hypervisor.
 
-The installer never applies a firewall silently. It writes the script, prints it, and applies it only after you say yes (and as root).
+The installer never applies a firewall silently. It writes the script and tells you where it is; it prints the script itself only
+when you say yes (as root, at the prompt or with `--apply-firewall`), just before running it.
 
 ## Install with Docker
 
@@ -73,13 +74,16 @@ You need what the [Hearth README](https://github.com/lottage/hearth) lists (Dock
 the installer). Then:
 
 ```
-pip install --upgrade "git+https://github.com/lottage/hearth@v0.1.0-rc.8" "git+https://github.com/lottage/grove@v0.1.0-rc.8"
+python3 -m venv ~/stonesage      # once (Windows PowerShell: py -m venv $HOME/stonesage)
+. ~/stonesage/bin/activate       # in every new terminal (Windows: & $HOME/stonesage/Scripts/Activate.ps1)
+pip install --upgrade "git+https://github.com/lottage/hearth@v0.1.0-rc.9" "git+https://github.com/lottage/grove@v0.1.0-rc.9"
 python -m lodestone.installer --docker --with-garden
 docker compose up -d --build
 ```
 
 The firewall comes first. At a terminal the installer asks whether to apply it now (it needs root). In a script it does not ask:
-it writes `grove-firewall.sh` and `grove-firewall.service` and applies neither. Until the rules are in, the reader's network is
+it writes `grove-firewall.sh` and `grove-firewall.service`, applies neither, and ends by printing the script's path and three
+commands: read it (`less`), apply it as root (`sudo sh`), then start the stack. Until the rules are in, the reader's network is
 open to your LAN, so do this before `docker compose up`. From the folder the installer wrote, as root:
 
 ```
@@ -98,6 +102,10 @@ It writes `docker-compose.yml`, `.env` (keys generated: `GROVE_CONTROL_KEY`, `GR
 Without `--with-garden` nothing of Grove is written. At a terminal the installer asks if you did not say either way.
 
 ## Start a session
+
+On a 4 GB card the first session is short, and that is normal: the small model it runs (about 4B parameters) often repeats itself,
+and the degeneration breaker ends the session with the reason `degeneration: ...` after a few turns, keeping the transcript.
+A larger model writes more (see "What to expect from a session, by model size" below).
 
 Open the GROVE tab in the cockpit (`http://localhost:8888`, log in) and press *start session* on the board. Everything the tab
 does is also on the API, with the login key as a bearer (`Authorization: Bearer <STONESAGE_API_KEY>`):
@@ -144,7 +152,7 @@ at the tag; for a release with published images it pulls them by version.
 ## Install on bare metal
 
 `sudo python -m lodestone.installer --apply --with-garden` (run it without `--apply` first to read the plan) adds, after the model
-engines: the users `grove` and `grovereader`; a virtual environment `/opt/grove/venv` with this package at v0.1.0-rc.8 (no dependencies:
+engines: the users `grove` and `grovereader`; a virtual environment `/opt/grove/venv` with this package at v0.1.0-rc.9 (no dependencies:
 the worker and the reader need only the standard library); `/etc/grove/worker.env` and `reader.env` (mode 600, root only); the units
 `grove-worker.service` and `grove-reader.service`; `/etc/grove/grove-nft.conf`, **written but loaded only if you passed
 `--apply-firewall`** (`sudo nft -f /etc/grove/grove-nft.conf`; remove with `nft delete table inet grove`); and the `grove` section and
@@ -155,7 +163,7 @@ not. If StoneSage runs on another machine, pass `--garden-stonesage-url http://<
 StoneSage must have the plugin in **its** environment too:
 
 ```
-pip install "grove @ git+https://github.com/lottage/grove@v0.1.0-rc.8"
+pip install "grove @ git+https://github.com/lottage/grove@v0.1.0-rc.9"
 ```
 
 ### What you need first

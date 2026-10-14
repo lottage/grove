@@ -211,6 +211,33 @@ class SessionTests(Base):
         events = [r for r in self.store.read_transcript("resident-1", s.id) if r["type"] == "journal"]
         self.assertEqual([e["source"] for e in events], ["plain_text"] * 3)
 
+    def test_a_journal_read_back_into_a_reply_does_not_duplicate_entries_on_the_board(self):
+        # rc.8 dry run: the resident read its journal and wrote it out as plain text; the raw "entry" marker lines inside that
+        # reply split it into extra entries with the same timestamps, so the board showed each one twice
+        model = Script(text_turn("first thought"), turn(call("read_journal")), text_turn("second thought"), turn(call("rest")))
+        s = self.run_session(model)
+        echoed = self.store.read_journal("resident-1")
+        self.assertIn("<!-- entry ts=", echoed)
+        self.store.append_journal("resident-1", s.id, "My journal so far:\n\n" + echoed)       # what the resident wrote back
+        entries = self.store.journal_entries("resident-1")
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(len({e["ts"] for e in entries}), 3)
+        posts = [p for p in self.store.board(resident="resident-1") if p["kind"] == "journal"]
+        self.assertEqual(len(posts), 3)
+        self.assertEqual(len({p["id"] for p in posts}), 3)
+        self.assertIn("first thought", entries[-1]["text"])                  # the echo stays inside its own entry's text
+
+    def test_a_journal_already_holding_an_echo_is_read_without_duplicates(self):
+        path = os.path.join(self.store.root("resident-1"), "journal.md")
+        one = "<!-- entry ts=100.000 session=s1 -->\nfirst\n\n"
+        two = "<!-- entry ts=200.000 session=s1 -->\nsecond\n\n"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:        # written by an older build: marks inside the third entry
+            f.write(one + two + "<!-- entry ts=300.000 session=s1 -->\n" + one + two + "third\n\n")
+        entries = self.store.journal_entries("resident-1")
+        self.assertEqual([e["ts"] for e in entries], [100.0, 200.0, 300.0])
+        self.assertIn("third", entries[2]["text"])
+
     def test_two_empty_replies_in_a_row_end_the_session(self):
         s = self.run_session(Script(text_turn(""), text_turn("   ")))
         self.assertEqual(s.reason, "empty_replies")
