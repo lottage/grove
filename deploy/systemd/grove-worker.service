@@ -1,0 +1,28 @@
+[Unit]
+Description=Grove worker (residents, sessions, board)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grove
+Group=grove
+WorkingDirectory=/var/lib/grove
+EnvironmentFile=/etc/grove/worker.env
+ExecStart=/opt/grove/venv/bin/python -m grove.worker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=1G
+ReadWritePaths=/var/lib/grove
+
+[Install]
+WantedBy=multi-user.target

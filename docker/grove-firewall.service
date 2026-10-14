@@ -1,0 +1,13 @@
+[Unit]
+Description=Grove: firewall for the reader's Docker network
+Before=docker.service
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /etc/grove/grove-firewall.sh
+ExecStop=/bin/sh /etc/grove/grove-firewall.sh --remove
+
+[Install]
+WantedBy=multi-user.target
