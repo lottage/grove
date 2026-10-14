@@ -267,7 +267,7 @@ class StartConditionTests(Base):
         cases = {
             "lease held": (lambda w: setattr(w.lease, "lease", {"id": "Z", "layout": "x", "expires": T0 + 600}), "lease is held"),
             "approval waiting": (lambda w: setattr(w, "pending", 1), "approval"),
-            "computer turn 5 min ago": (lambda w: setattr(w, "last_turn", T0 - 300), "Computer answered 5 min ago"),
+            "computer turn 1 min ago": (lambda w: setattr(w, "last_turn", T0 - 60), "Computer answered 1 min ago"),
             "gate closed for the GPU": (lambda w: w.close_gate("vision served a request in the last 5 min"), "idle gate is closed"),
             "gate missing": (lambda w: w.gate["gpus"].pop(GPU), "idle gate is closed"),
             "manual session running": (lambda w: setattr(w.worker, "running", "20261013T000000Z-beef"), "already running"),
@@ -421,6 +421,58 @@ class WindowTests(Base):
             w.sched._end_window("test", preempted=False, own=False)
             w.clock.advance(400)
         self.assertEqual(firsts, ["ada", "bo"])
+
+    def test_a_configured_resident_the_worker_does_not_list_yet_is_scheduled(self):
+        w = self.world()
+        w.worker.residents_list = []                    # the worker has never been asked to create anyone
+        w.assign("bo", "bonsai")
+        w.tick()
+        self.assertEqual(w.worker.started[0][0]["resident"], "ada")
+        for _ in range(2):
+            w.worker.finish()
+            w.clock.advance(60)
+            w.tick()
+        self.assertEqual([s[0]["resident"] for s in w.worker.started], ["ada", "bo", "ada"])
+
+    def test_paused_residents_are_skipped_whether_the_worker_or_the_config_says_so(self):
+        w = self.world()
+        w.worker.residents_list = [{"id": "ada", "paused": True}, {"id": "bo", "paused": False}]
+        w.assign("bo", "bonsai")
+        w.assign("cy", "bonsai")                       # configured only, not paused
+        w.config["garden"]["residents"]["cy"]["paused"] = True
+        w.assign("dee", "bonsai")                      # configured only, live
+        for _ in range(4):
+            w.tick()
+            w.worker.finish()
+            w.clock.advance(60)
+        seen = {s[0]["resident"] for s in w.worker.started}
+        self.assertEqual(seen, {"bo", "dee"})
+
+    def test_all_paused_starts_nothing(self):
+        w = self.world()
+        w.worker.residents_list = [{"id": "ada", "paused": True}]
+        w.tick()
+        self.assertEqual(w.worker.started, [])
+        self.assertIn("every resident is paused", w.sched.reason)
+
+    def test_a_new_configured_resident_gets_its_first_turn_before_the_rotation_moves_on(self):
+        w = self.world()
+        w.worker.residents_list = [{"id": "ada", "paused": False}, {"id": "bo", "paused": False}]
+        w.assign("bo", "bonsai")
+        w.tick()                                       # ada
+        w.worker.finish()
+        w.clock.advance(60)
+        w.tick()                                       # bo: both have had a session now, the rotation goes on
+        self.assertEqual([s[0]["resident"] for s in w.worker.started], ["ada", "bo"])
+        w.assign("ab", "bonsai")                       # configured, never run; sorts before ada and bo
+        w.worker.finish()
+        w.clock.advance(60)
+        w.tick()
+        self.assertEqual(w.worker.started[-1][0]["resident"], "ab")   # the rotation would have said ada
+        w.worker.finish()
+        w.clock.advance(60)
+        w.tick()
+        self.assertEqual(w.worker.started[-1][0]["resident"], "ada")  # and then back to the rotation
 
     def test_no_session_starts_with_less_than_min_session_time_left(self):
         w = self.world()
@@ -587,6 +639,121 @@ class CoordinatorGuardTests(Base):
         w.tick()
         self.assertEqual(w.lease.acquired, [])
         self.assertIn("disabled", w.sched.reason)
+
+
+# ---- the demand gate (2026-10-14) ---------------------------------------------------------------------------------------------
+def demand_gate(w, household=(), demand_shared=(), cockpit=None, closed=()):
+    """A gate shaped like idle_gate.check(): `open` obeys the household signal, `demand_open` only the hardware."""
+    gpus = {}
+    for name in (GPU, OTHER):
+        reasons = ["GPU 50 % busy"] if name in closed else []
+        gpus[name] = {"open": not reasons and not household and not demand_shared, "reasons": reasons,
+                      "demand_open": not reasons and not demand_shared,
+                      "demand_open_with_cockpit": not reasons and not demand_shared and not cockpit}
+    w.gate = {"gpus": gpus, "shared_reasons": list(household) + list(demand_shared), "demand_shared_reasons": list(demand_shared),
+              "cockpit": cockpit}
+
+
+class DemandGateTests(Base):
+    AWAKE = ["Alex is awake (using their phone)", "Sam is awake (24 steps)", "house active 2 min ago and Sam may be up"]
+
+    def test_the_garden_opens_while_people_are_awake(self):
+        w = self.world()
+        demand_gate(w, household=self.AWAKE)
+        w.tick()
+        self.assertEqual(w.sched.state, "running")
+        self.assertEqual(w.lease.acquired[0]["layout"], "longctx_6600")
+
+    def test_it_keeps_running_through_a_whole_film(self):
+        w = self.world()
+        demand_gate(w)
+        w.tick()
+        demand_gate(w, household=self.AWAKE)
+        w.tick(20, step=20)
+        self.assertEqual(w.sched.state, "running")
+        self.assertEqual(w.worker.stopped, [])
+
+    def test_each_demand_reason_closes_it(self):
+        for kw in ({"demand_shared": ["1 approval(s) waiting"]}, {"demand_shared": ["Computer answered 1 min ago"]}, {"closed": (GPU,)}):
+            w = self.world()
+            demand_gate(w, **kw)
+            w.tick()
+            self.assertEqual(w.lease.acquired, [], kw)
+        w = self.world()
+        w.last_turn = w.clock() - 60                             # a turn 1 min ago: the scheduler checks Computer directly too
+        demand_gate(w)
+        w.tick()
+        self.assertEqual(w.lease.acquired, [])
+        w.last_turn = w.clock() - 180                            # 3 min: past the default 2
+        w.sched.retry_until = 0
+        w.tick()
+        self.assertEqual(w.sched.state, "running")
+
+    def test_a_running_window_ends_on_demand_not_on_household(self):
+        w = self.world()
+        demand_gate(w)
+        w.tick()
+        w.clock.advance(5)
+        demand_gate(w, demand_shared=["1 approval(s) waiting"])
+        w.tick()
+        self.assertIsNone(w.sched.window)
+        self.assertEqual(w.sched.state, "preempted")
+
+    def test_the_cockpit_closes_every_garden_lease(self):
+        w = self.world()
+        demand_gate(w, cockpit="someone is using StoneSage (4 s ago)")
+        w.tick()
+        self.assertEqual(w.lease.acquired, [])                   # vision's layout too: every garden lease yields
+        w = self.world(allow_coordinator_layouts=True)
+        w.assign("ada", "big")
+        demand_gate(w, cockpit="someone is using StoneSage (4 s ago)")
+        w.tick()
+        self.assertEqual(w.lease.acquired, [])
+        demand_gate(w)
+        w.tick()
+        self.assertEqual([a["layout"] for a in w.lease.acquired], ["longctx_6750"])
+        w.clock.advance(5)
+        demand_gate(w, cockpit="someone is using StoneSage (4 s ago)")
+        w.tick()
+        self.assertIsNone(w.sched.window)
+
+    def test_the_6750_comes_first_when_both_are_open_and_coordinator_layouts_are_allowed(self):
+        w = self.world(allow_coordinator_layouts=True)
+        w.config["garden"]["models"]["bonsai"]["layouts"] = ["longctx_6600", "longctx_6750"]
+        demand_gate(w)
+        w.tick()
+        self.assertEqual([a["layout"] for a in w.lease.acquired], ["longctx_6750"])
+
+    def test_without_the_flag_or_with_the_6750_closed_the_configured_order_decides(self):
+        w = self.world()
+        w.config["garden"]["models"]["bonsai"]["layouts"] = ["longctx_6600", "longctx_6750"]
+        demand_gate(w)
+        w.tick()
+        self.assertEqual([a["layout"] for a in w.lease.acquired], ["longctx_6600"])
+        w = self.world(allow_coordinator_layouts=True)
+        w.config["garden"]["models"]["bonsai"]["layouts"] = ["longctx_6600", "longctx_6750"]
+        demand_gate(w, closed=(OTHER,))
+        w.tick()
+        self.assertEqual([a["layout"] for a in w.lease.acquired], ["longctx_6600"])
+
+    def test_history_from_the_old_rule_is_ignored(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="gh-"), "h.jsonl")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), True)
+        with open(path, "w", encoding="utf-8") as f:
+            for i in range(8):                                  # eight old, comparable-looking openings of 3 h, no version field
+                t = T0 + i * 20000
+                f.write(json.dumps({"gpu": GPU, "event": "open", "at": t}) + "\n")
+                f.write(json.dumps({"gpu": GPU, "event": "close", "at": t + 10800, "opened_at": t, "why": [], "own": False,
+                                    "censored": False}) + "\n")
+        h = gs.GateHistory(path, Clock(T0 + 10 ** 6))
+        self.assertEqual(h.lengths(GPU), [])
+        self.assertNotIn(GPU, h.open_since)
+        h.observe({GPU: (False, [])}, T0 + 10 ** 6)
+        h.observe({GPU: (True, [])}, T0 + 10 ** 6 + 10)
+        h.observe({GPU: (False, ["x"])}, T0 + 10 ** 6 + 710)
+        again = gs.GateHistory(path, Clock())
+        self.assertEqual(again.lengths(GPU), [700.0])           # new records are versioned and count
+        self.assertEqual(gs.estimate_remaining(again.lengths(GPU), 0, 1800)["basis"], "default")
 
 
 # ---- the CPU slot ----------------------------------------------------------------------------------------------------------

@@ -155,8 +155,13 @@ class TestSchedulerTakeback(SchedulerBase):
         w.assign("ada", "bonsai-any")
         return w
 
-    def test_the_6600_is_preferred(self):
+    def test_the_6750_is_preferred_when_coordinator_layouts_are_allowed(self):
         w = self.multi(allow_coordinator_layouts=True)
+        w.tick()
+        self.assertEqual([a["layout"] for a in w.lease.acquired], ["longctx_6750"])
+
+    def test_the_6600_is_used_without_the_flag(self):
+        w = self.multi()
         w.tick()
         self.assertEqual([a["layout"] for a in w.lease.acquired], ["longctx_6600"])
 

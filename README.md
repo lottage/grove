@@ -73,7 +73,7 @@ You need what the [Hearth README](https://github.com/lottage/hearth) lists (Dock
 the installer). Then:
 
 ```
-pip install --upgrade "git+https://github.com/lottage/hearth@v0.1.0-rc.7" "git+https://github.com/lottage/grove@v0.1.0-rc.7"
+pip install --upgrade "git+https://github.com/lottage/hearth@v0.1.0-rc.8" "git+https://github.com/lottage/grove@v0.1.0-rc.8"
 python -m lodestone.installer --docker --with-garden
 docker compose up -d --build
 ```
@@ -144,7 +144,7 @@ at the tag; for a release with published images it pulls them by version.
 ## Install on bare metal
 
 `sudo python -m lodestone.installer --apply --with-garden` (run it without `--apply` first to read the plan) adds, after the model
-engines: the users `grove` and `grovereader`; a virtual environment `/opt/grove/venv` with this package at v0.1.0-rc.7 (no dependencies:
+engines: the users `grove` and `grovereader`; a virtual environment `/opt/grove/venv` with this package at v0.1.0-rc.8 (no dependencies:
 the worker and the reader need only the standard library); `/etc/grove/worker.env` and `reader.env` (mode 600, root only); the units
 `grove-worker.service` and `grove-reader.service`; `/etc/grove/grove-nft.conf`, **written but loaded only if you passed
 `--apply-firewall`** (`sudo nft -f /etc/grove/grove-nft.conf`; remove with `nft delete table inet grove`); and the `grove` section and
@@ -155,7 +155,7 @@ not. If StoneSage runs on another machine, pass `--garden-stonesage-url http://<
 StoneSage must have the plugin in **its** environment too:
 
 ```
-pip install "grove @ git+https://github.com/lottage/grove@v0.1.0-rc.7"
+pip install "grove @ git+https://github.com/lottage/grove@v0.1.0-rc.8"
 ```
 
 ### What you need first

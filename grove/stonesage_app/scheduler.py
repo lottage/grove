@@ -7,13 +7,15 @@ recorded either way (data/garden_gate_history.jsonl), so the opening-length hist
 
 What a start needs (all of it, checked in this order):
   - no engine lease is held (by anyone), no session is running (a manual one counts), and the last window ended >= cooldown_s ago
-  - nobody is waiting on Computer: no approval pending, no Computer turn in the last recent_turn_min (the gate covers both; this
+  - nobody is waiting on Computer: no approval pending, no Computer turn in the last idle_gate.computer_turn_min (default 2; the gate covers both; this
     checks them again, directly, because a lease would take the vision engine away from Computer's camera looks)
   - a resident that is not paused, has a model assigned (garden.residents.<id>.model), and is inside its budgets
     (max_sessions_24h rolling, max_tokens_hour rolling)
-  - the model's layout: its engines' roles and GPUs known, and the idle gate OPEN for every GPU the layout evicts from. A model may list
-    several layouts (`layouts`, in order of preference; `layout` alone is a list of one): the first that is ready is used, so
-    [RX 6600 layout, RX 6750 XT layout] prefers the 6600 and falls back to the 6750 when only that gate is open. A layout that evicts
+  - the model's layout: its engines' roles and GPUs known, and the idle gate's DEMAND view open for every GPU the layout evicts from
+    (hardware demand only since 2026-10-14: GPU busy, engines idle, no approval, no Computer turn; whether anyone is awake, at home or
+    watching a film is never a reason. The cockpit signal (someone using the StoneSage page) closes it for every garden lease. The garden's own load on a lent card never does: while its lease is held, that card's busy/engine reasons are ignored). A model may list
+    several layouts (`layouts`, in order of preference; `layout` alone is a list of one): the first that is ready is used; with `allow_coordinator_layouts` on, a ready coordinator-evicting layout (the RX 6750 XT) comes first, since the
+    6600 is vision's and lending it blinds the sentry. A layout that evicts
     the coordinator (Computer then answers from the Courage-lite stand-in) additionally needs ALL of: `allow_coordinator_layouts` true
     (default false), the layout's stand-in configured AND its eval passed (`engine_stand_ins.<name>.eval_passed`), and no takeback
     cooldown (below)
@@ -22,7 +24,8 @@ What a start needs (all of it, checked in this order):
 Opening-length estimate: every gate opening (open -> close) is recorded per GPU. For the opening that is open now, with age A: take the
 past openings that lasted at least A, and use the median of (length - A). Fewer than 5 such openings = not enough history, so the
 estimate is default_window_min. Openings the scheduler itself ended (its window ran out, or the schedule was switched off) and openings
-cut off by a StoneSage restart are left out: they say nothing about how long the house stays quiet.
+cut off by a StoneSage restart are left out: they say nothing about how long the hardware stays free. History records carry the gate
+version (`v`); openings recorded under the old household rule have no version and are ignored, so estimates come from demand-gate openings only.
 
 Window and lease: ttl = min(estimate, max_window_min) + margin_min. The session (and the window) end `stop_before_end_min` (12, never
 less) before the lease's own end, so the engine lease's phone check-in (10 min before the end) never fires for a garden lease. A lease
@@ -33,15 +36,20 @@ that fits the time left.
 
 Takeback (2026-10-13): every garden lease is acquired with yield_to_computer. The platform's takeback (stonesage/courage/takeback.py) can
 take a coordinator-evicting lease back at any moment: Computer on the stand-in fails or needs the full brain, or a person starts using
-the cockpit (stonesage/activity.py; also a shared reason of the idle gate, so the garden neither starts nor keeps running meanwhile).
+the cockpit (stonesage/activity.py; also closes the gate for a coordinator-evicting layout, so the garden neither starts nor keeps running meanwhile).
 It calls `yield_to_computer(why, cooldown_s)` (registered through the `register_yielder` service; this module imports nothing of the
 platform's courage code): the running session is stopped at once (the worker saves the draft, reason "takeback: <why>") and the next
 tick ends the window; the takeback releases the lease itself and waits for the coordinator. After a takeback no coordinator-evicting layout
 is taken for `courage.takeback.cooldown_min` (default 60; the platform's `takeback_cooldown`). Layouts that leave the coordinator alone are
 not affected by the cooldown.
+Per card (2026-10-14): a camera request while the garden holds the vision card (the RX 6600 lease) is a hot-load: the takeback calls
+`yield_to_computer(why, cooldown_s, resource="vision")`, which stops the session only if the held lease really has that card out, and a
+layout that evicts the vision server waits `courage.takeback.vision_cooldown_min` (10) afterwards. Each card has its own cooldown; a
+garden session on the other card is never disturbed. `takeback_cooldown_fn(role)` is asked per role (an older 0-argument function counts
+for the coordinator only).
 
 Preemption (polled every running_poll_s): an approval appears, Computer gets a turn after the window began, the gate closes (its
-shared reasons: approvals, a Computer turn, somebody awake; the per-GPU reasons are ignored while the lease is held, because our own
+demand reasons: approvals, a Computer turn; the per-GPU reasons are ignored while the lease is held, because our own
 session is what makes the card busy and the lent-out engine is not scraped), the lease is lost, or the schedule is switched off:
 the session is stopped at once (the worker saves the draft) and the lease released. Computer always wins.
 
@@ -55,6 +63,7 @@ Every start, preemption and release is traced as kind "garden"; skips are traced
 Status: GET /api/garden/schedule; Prometheus gauges from metrics().
 """
 
+import inspect
 import json
 import logging
 import os
@@ -78,7 +87,7 @@ DEFAULTS: Dict[str, Any] = {
     "margin_min": 10,                # lease ttl = min(estimate, max_window_min) + margin_min
     "stop_before_end_min": 12,       # floor 12: the lease checks in with the phone at 10
     "min_session_s": 180,            # no session is started with less time than this left in the window
-    "recent_turn_min": 15,
+    "recent_turn_min": None,         # None = idle_gate.computer_turn_min (default 2); a number here overrides it for the garden only
     "cooldown_s": 300,               # after any window ends, nothing starts for this long
     "retry_s": 60,                   # after a refused acquire / failed start
     "poll_s": 20,
@@ -94,9 +103,13 @@ OWN_END_WINDOW_S = 900            # a gate close within 15 min of our own window
 HOUSE = "house"                   # the pseudo-GPU: the gate's shared conditions alone (for the CPU slot)
 STATES = ("disabled", "idle", "waiting", "running", "preempted")
 COORDINATOR_ROLE = "coordinator"
+VISION_ROLE = "vision"
+COOLDOWN_ROLES = (COORDINATOR_ROLE, VISION_ROLE)       # the cards a takeback can cool down
+GATE_VERSION = 2                  # history written under the old rule (household signals closed the gate) is not comparable and is ignored
 MAX_HISTORY_LINES = 4000
 KEEP_HISTORY_LINES = 2000
 ACTION_PREEMPT = "preempted"
+RESIDENT_ID = re.compile(r"^[a-z0-9-]{1,64}$")     # the same ids the worker and the routes accept
 
 
 def _hhmm(ts: float) -> str:
@@ -140,7 +153,7 @@ class GateHistory:
                         continue
                     self._lines += 1
                     gpu = r.get("gpu")
-                    if not gpu:
+                    if not gpu or r.get("v") != GATE_VERSION:     # older openings were measured under another rule
                         continue
                     if r.get("event") == "open":
                         self.open_since[gpu] = float(r["at"])
@@ -181,10 +194,10 @@ class GateHistory:
             since = self.open_since.get(gpu)
             if is_open and since is None:
                 self.open_since[gpu] = now
-                self._write({"gpu": gpu, "event": "open", "at": round(now, 3)})
+                self._write({"gpu": gpu, "event": "open", "at": round(now, 3), "v": GATE_VERSION})
             elif not is_open and since is not None:
                 own_at = self.own_end.get(gpu)
-                rec = {"gpu": gpu, "event": "close", "at": round(now, 3), "opened_at": since, "why": list(reasons)[:6],
+                rec = {"gpu": gpu, "event": "close", "at": round(now, 3), "v": GATE_VERSION, "opened_at": since, "why": list(reasons)[:6],
                        "own": bool(own_at is not None and 0 <= now - own_at <= OWN_END_WINDOW_S),
                        # first look since StoneSage started: the opening's real end is unknown (the process was not watching)
                        "censored": first}
@@ -293,6 +306,10 @@ class SessionLog:
                 break
         return statistics.median(rates) if rates else None
 
+    def has_session(self, resident: str) -> bool:
+        """Whether this resident has a session in the ledger (48 h: the ledger's own horizon)."""
+        return any(r.get("resident") == resident for r in self.rows.values())
+
     def per_resident_24h(self, now: Optional[float] = None) -> Dict[str, int]:
         now = self.clock() if now is None else now
         out: Dict[str, int] = {}
@@ -317,7 +334,7 @@ class GardenScheduler:
         takeback_cooldown_fn() -> seconds until a coordinator-evicting layout may be borrowed again; takeback_status_fn() -> the last takeback."""
         self.takeback_cooldown_fn, self.takeback_status_fn = takeback_cooldown_fn, takeback_status_fn
         self.yield_request: Optional[Dict[str, Any]] = None
-        self.takeback_until = 0.0
+        self.takeback_until: Dict[str, float] = {}           # role -> when a layout that evicts it may be borrowed again
         self.cfg_fn, self.gate_fn, self.lease, self.worker, self.active = cfg_fn, gate_fn, lease, worker, active
         self.last_turn_fn, self.pending_fn, self.trace = last_turn_fn, pending_fn, trace
         self.systemctl, self.http_ok, self.clock, self.sleep = systemctl, http_ok, clock, sleep
@@ -356,6 +373,26 @@ class GardenScheduler:
         r = (section(self.cfg_fn() or {}).get("residents") or {}).get(resident)
         return str(r.get("model") or "") if isinstance(r, dict) else ""
 
+    def _residents(self, listed: List[Any]) -> Tuple[List[str], List[str]]:
+        """(open, paused), each sorted: the residents a session may go to. Candidates are the worker's residents plus the
+        configured ones (garden.residents), so a resident that was assigned a model but has never had a session still gets
+        one: the worker creates it on its first start. Paused = the worker's flag or `paused` in the configured entry.
+        Ids the worker would refuse are left out."""
+        flags: Dict[str, bool] = {}
+        for r in listed or []:
+            if isinstance(r, dict) and RESIDENT_ID.match(str(r.get("id") or "")):
+                flags[r["id"]] = bool(r.get("paused"))
+        conf = section(self.cfg_fn() or {}).get("residents")
+        for rid, r in (conf.items() if isinstance(conf, dict) else []):
+            if RESIDENT_ID.match(str(rid)):
+                paused = isinstance(r, dict) and bool(r.get("paused"))
+                flags[rid] = flags.get(rid, False) or paused
+        return sorted(k for k, v in flags.items() if not v), sorted(k for k, v in flags.items() if v)
+
+    def _fresh_first(self, ids: List[str]) -> List[str]:
+        """Residents with no session yet come first (keeping their order), then the rest."""
+        return [r for r in ids if not self.sessions.has_session(r)] + [r for r in ids if self.sessions.has_session(r)]
+
     # ------------------------------------------------------------------ small things ----
     def holding(self) -> Optional[str]:
         """Why a manual start must wait: the scheduler holds a window (or is just taking one), else None."""
@@ -393,7 +430,18 @@ class GardenScheduler:
         return self._gate
 
     def _shared(self, gate: Dict[str, Any]) -> List[str]:
-        return list(gate.get("shared_reasons") or [])
+        """Why the gate is closed for background work: hardware demand only (approvals, a Computer turn, nothing about who is
+        awake). Falls back to the full list for a gate that does not report the demand view."""
+        return list(gate["demand_shared_reasons"] if "demand_shared_reasons" in gate else gate.get("shared_reasons") or [])
+
+    def _turn_min(self, cfg: Dict[str, Any]) -> float:
+        if cfg.get("recent_turn_min") is not None:
+            return float(cfg["recent_turn_min"])
+        ig = (self.cfg_fn() or {}).get("idle_gate")
+        try:
+            return float((ig or {}).get("computer_turn_min", 2))
+        except (TypeError, ValueError):
+            return 2.0
 
     def _observe(self, gate: Dict[str, Any], now: float) -> None:
         shared = self._shared(gate)
@@ -403,7 +451,7 @@ class GardenScheduler:
             if gpu in held:            # our own lease: the card is busy because of us and the lent-out engine is not scraped
                 states[gpu] = (not shared, shared)
             else:
-                states[gpu] = (bool(g.get("open")), list(g.get("reasons") or []) + shared)
+                states[gpu] = (bool(g.get("demand_open", g.get("open"))), list(g.get("reasons") or []) + shared)
         states[HOUSE] = (not shared, shared)
         self.history.observe(states, now)
 
@@ -419,6 +467,12 @@ class GardenScheduler:
 
     # ------------------------------------------------------------------ the tick ----
     def tick(self) -> None:
+        reconcile = getattr(self.lease, "reconcile", None)      # engine lease self-healing: a layout left running with no lease held
+        if callable(reconcile):
+            try:
+                reconcile()
+            except Exception as e:
+                logger.warning("garden scheduler: lease reconcile failed: %s", e)
         now = self.clock()
         cfg = self.cfg()
         w = self.window
@@ -451,19 +505,34 @@ class GardenScheduler:
             est = self.estimate(HOUSE, now)
             return self._with_estimate(est, cfg, {"kind": "cpu", "unit": spec["unit"], "gpus": [HOUSE]}, "the house gate")
         why: List[str] = []
+        ready: List[Dict[str, Any]] = []
         for layout in layout_choices(spec):                           # in the order of preference
             ok, reason, plan = self._layout_ready(layout, cfg, gate, now)
             if ok:
-                return True, "", plan
-            why.append(reason)
+                ready.append(plan)
+            else:
+                why.append(reason)
+        if ready:
+            # With coordinator layouts allowed, the RX 6750 XT is the garden's card: among the layouts whose gate is open it comes
+            # first (the 6600 is vision's, and lending it blinds the sentry). Otherwise the configured order decides.
+            if cfg["allow_coordinator_layouts"]:
+                ready.sort(key=lambda p: 0 if p.get("coord") else 1)
+            return True, "", ready[0]
         return False, "; ".join(why)[:300], {}
 
-    def takeback_left(self) -> float:
-        """Seconds until a coordinator-evicting layout may be borrowed again after a takeback."""
-        left = self.takeback_until - self.clock()
+    def takeback_left(self, role: str = COORDINATOR_ROLE) -> float:
+        """Seconds until a layout that evicts `role` (coordinator | vision) may be borrowed again after a takeback."""
+        left = self.takeback_until.get(role, 0.0) - self.clock()
         if self.takeback_cooldown_fn:
             try:
-                left = max(left, float(self.takeback_cooldown_fn() or 0.0))
+                try:
+                    takes_role = len(inspect.signature(self.takeback_cooldown_fn).parameters) > 0
+                except (TypeError, ValueError):
+                    takes_role = False
+                if takes_role:
+                    left = max(left, float(self.takeback_cooldown_fn(role) or 0.0))
+                elif role == COORDINATOR_ROLE:             # an older function knows the coordinator only
+                    left = max(left, float(self.takeback_cooldown_fn() or 0.0))
             except Exception:
                 pass
         return max(0.0, left)
@@ -483,13 +552,20 @@ class GardenScheduler:
             if not info.get("stand_in_ready"):
                 return False, ("layout %s would take Computer's coordinator and its stand-in is not ready (engine_stand_ins "
                                "eval_passed is not set, or the layout names none)" % layout), {}
-            left = self.takeback_left()
+            left = self.takeback_left(COORDINATOR_ROLE)
             if left > 0:
                 return False, "layout %s: Computer took the coordinator back; not again for %d min" % (layout, round(left / 60)), {}
+        if VISION_ROLE in (info.get("roles") or []):
+            left = self.takeback_left(VISION_ROLE)
+            if left > 0:
+                return False, "layout %s: Computer took the camera engine back; not again for %d min" % (layout, max(1, round(left / 60))), {}
         closed = []
+        coord = COORDINATOR_ROLE in (info.get("roles") or [])
+        if gate.get("cockpit"):                            # every garden lease yields to Computer: someone on the page closes it
+            return False, "the idle gate is closed: " + str(gate["cockpit"]), {}
         for gpu in info["gpus"]:
             g = (gate.get("gpus") or {}).get(gpu)
-            if not g or not g.get("open"):
+            if not g or not g.get("demand_open", g.get("open") if g else False):
                 closed.append("%s: %s" % (gpu, ", ".join((g or {}).get("reasons") or shared or ["not reported"])))
         if closed:
             return False, "the idle gate is closed: " + "; ".join(closed)[:200], {}
@@ -497,7 +573,7 @@ class GardenScheduler:
         if not all(ests):
             return False, "no opening recorded yet for %s" % ", ".join(info["gpus"]), {}
         est = min(ests, key=lambda e: e["seconds"])
-        return self._with_estimate(est, cfg, {"kind": "lease", "layout": layout, "gpus": list(info["gpus"])}, "the gate")
+        return self._with_estimate(est, cfg, {"kind": "lease", "layout": layout, "gpus": list(info["gpus"]), "coord": coord}, "the gate")
 
     def _on_stand_in(self) -> Optional[str]:
         """Why the CPU slot is not ours: Computer is on the stand-in (it shares the CPU engine), or a lease is held. None = free."""
@@ -547,7 +623,7 @@ class GardenScheduler:
         if pending:
             return self._skip("%d approval(s) waiting for Computer" % pending)
         last = self.last_turn_fn()
-        if last and now - last < float(cfg["recent_turn_min"]) * 60:
+        if last and now - last < self._turn_min(cfg) * 60:
             return self._skip("Computer answered %d min ago" % round((now - last) / 60))
         try:
             health = self.worker.health()
@@ -556,13 +632,13 @@ class GardenScheduler:
             return self._skip("the garden worker did not answer (%s)" % str(e)[:80])
         if health.get("running"):
             return self._skip("a session is already running (started by hand)")
-        if not residents:
+        open_ids, paused_ids = self._residents(residents)
+        if not open_ids and not paused_ids:
             return self._skip("the garden has no residents")
-        order = sorted(r["id"] for r in residents if isinstance(r, dict) and r.get("id") and not r.get("paused"))
-        if not order:
+        if not open_ids:
             return self._skip("every resident is paused")
-        start_at = self.rr.get("_first", 0) % len(order)
-        order = order[start_at:] + order[:start_at]
+        start_at = self.rr.get("_first", 0) % len(open_ids)
+        order = self._fresh_first(open_ids[start_at:] + open_ids[:start_at])
         ready: Dict[str, Tuple[bool, str, Dict[str, Any]]] = {}
         why_not: List[str] = []
         for rid in order:
@@ -580,7 +656,7 @@ class GardenScheduler:
             if not ok:
                 why_not.append("%s (%s): %s" % (rid, model, why))
                 continue
-            self.rr["_first"] = (start_at + order.index(rid) + 1) % max(1, len(order))
+            self.rr["_first"] = (open_ids.index(rid) + 1) % len(open_ids)
             return self._open_window(cfg, model, rid, plan, now)
         self._skip("; ".join(why_not)[:300] or "nothing to start", "idle" if all("assigned" in w for w in why_not) else "waiting")
 
@@ -599,7 +675,7 @@ class GardenScheduler:
                     return
                 expires = float(res["expires"])
                 window = {"kind": "lease", "layout": plan["layout"], "lease_id": res["lease_id"], "expires": expires,
-                          "deadline": expires - float(cfg["stop_before_end_min"]) * 60}
+                          "coord": bool(plan.get("coord")), "deadline": expires - float(cfg["stop_before_end_min"]) * 60}
             else:
                 err = self._start_cpu(plan["unit"], self.models()[model]["engine_url"], cfg)
                 if err:
@@ -646,12 +722,16 @@ class GardenScheduler:
             residents = self.worker.residents().get("residents") or []
         except Exception:
             return False
-        mine = sorted(r["id"] for r in residents if isinstance(r, dict) and not r.get("paused") and self.assignment(r["id"]) == w["model"])
+        open_ids, _paused = self._residents(residents)
+        mine = [r for r in open_ids if self.assignment(r) == w["model"]]
         mine = [r for r in mine if not self._budget_ok(r, cfg, now)]
         if not mine:
             return False
+        fresh = [r for r in mine if not self.sessions.has_session(r)]
         if preferred in mine:
             pick = preferred
+        elif fresh:
+            pick = fresh[0]                              # a configured resident's first turn comes before the rotation moves on
         else:
             last = w.get("last_resident")
             pick = next((r for r in mine if last is None or r > last), mine[0])
@@ -690,6 +770,8 @@ class GardenScheduler:
         if last and last > w["t0"]:
             return self._end_window("Computer got a turn", preempted=True, own=False)
         shared = self._shared(gate)
+        if gate.get("cockpit"):
+            shared = shared + [str(gate["cockpit"])]
         if shared:
             return self._end_window("the gate closed: " + "; ".join(shared[:3]), preempted=True, own=False)
         if now >= w["deadline"]:
@@ -714,12 +796,17 @@ class GardenScheduler:
             if not self._start_session(cfg):
                 return self._end_window("no time or no resident left in the window", preempted=False, own=True)
 
-    def yield_to_computer(self, why: str, cooldown_s: float = 0.0) -> Dict[str, Any]:
+    def yield_to_computer(self, why: str, cooldown_s: float = 0.0, resource: str = COORDINATOR_ROLE) -> Dict[str, Any]:
         """Computer takes the GPU back (the platform's takeback calls this from any thread; it registered through `register_yielder`).
         Stops the running session at once, so the worker saves the draft (reason = `why`, e.g. "takeback: tool"), and asks the next tick to
-        end the window. The takeback releases the lease itself. Starts the cooldown for coordinator-evicting layouts."""
+        end the window. The takeback releases the lease itself. Starts the cooldown for layouts that evict `resource`; a window whose lease does
+        not have that card out (the garden holds the other GPU) is left alone."""
+        held = getattr(self.lease, "lease", None)
+        roles = (held.get("evicted_roles") or []) if isinstance(held, dict) else []
+        if roles and resource not in roles:
+            return {"ok": True, "stopped": False, "note": "the garden's lease does not hold the %s" % resource}
         if cooldown_s:
-            self.takeback_until = max(self.takeback_until, self.clock() + float(cooldown_s))
+            self.takeback_until[resource] = max(self.takeback_until.get(resource, 0.0), self.clock() + float(cooldown_s))
         w = self.window
         if not w and not self.starting:
             return {"ok": True, "stopped": False, "note": "no garden window"}
@@ -778,7 +865,7 @@ class GardenScheduler:
         now = self.clock()
         cfg = self.cfg()
         gate = self._gate or {}
-        gates = {gpu: {"open": bool(g.get("open")), "reasons": g.get("reasons") or []} for gpu, g in (gate.get("gpus") or {}).items()}
+        gates = {gpu: {"open": bool(g.get("demand_open", g.get("open"))), "reasons": g.get("reasons") or []} for gpu, g in (gate.get("gpus") or {}).items()}
         shared = self._shared(gate)
         est = {}
         for gpu in list(gates) + [HOUSE]:
@@ -811,8 +898,9 @@ class GardenScheduler:
                 last = (self.takeback_status_fn() or {}).get("last")
             except Exception:
                 last = None
-        left = self.takeback_left()
-        return {"last": last, "coordinator_layouts_blocked_for_s": round(left) if left > 0 else 0}
+        left, vleft = self.takeback_left(COORDINATOR_ROLE), self.takeback_left(VISION_ROLE)
+        return {"last": last, "coordinator_layouts_blocked_for_s": round(left) if left > 0 else 0,
+                "vision_layouts_blocked_for_s": round(vleft) if vleft > 0 else 0}
 
     def metrics(self) -> List[str]:
         enabled = 1 if self.cfg()["enabled"] else 0
