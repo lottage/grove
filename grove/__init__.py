@@ -11,5 +11,5 @@ session is recorded as a research record. Three parts:
 The worker and the reader import nothing from StoneSage and run alone (their own containers or machines). Only the plugin needs
 StoneSage, and StoneSage never imports it: it is listed in config.json "apps" and found through the `stonesage.apps` entry point."""
 
-__version__ = "0.1.0rc5"
+__version__ = "0.1.0rc6"
 STONESAGE_API = "0.1"    # the StoneSage API this version is written for (stonesage.API_VERSION); apps.load_apps checks it, the worker never imports stonesage

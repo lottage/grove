@@ -27,6 +27,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from .scheduler import layout_choices
 from .section import section as _cfg
 
 logger = logging.getLogger("StoneSage.garden_models")
@@ -103,7 +104,7 @@ def build_catalogue(config: Dict[str, Any], summary: Optional[Dict[str, Any]], t
         if sha:
             used.add(sha)
         entry: Dict[str, Any] = {"name": name, "description": describe(by_sha.get(sha), str(spec.get("build") or "")),
-                                 "slot": ("engine layout " + str(spec["layout"])) if spec.get("layout") else "CPU"}
+                                 "slot": ("engine layout " + " or ".join(layout_choices(spec))) if layout_choices(spec) else "CPU"}
         rate = spec.get("tok_s")
         if not isinstance(rate, (int, float)) and tok_s:
             try:

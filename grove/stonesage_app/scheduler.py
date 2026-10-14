@@ -11,8 +11,12 @@ What a start needs (all of it, checked in this order):
     checks them again, directly, because a lease would take the vision engine away from Computer's camera looks)
   - a resident that is not paused, has a model assigned (garden.residents.<id>.model), and is inside its budgets
     (max_sessions_24h rolling, max_tokens_hour rolling)
-  - the model's layout: not one that evicts the coordinator (unless allow_coordinator_layouts), its engines' roles and GPUs known,
-    and the idle gate OPEN for every GPU the layout evicts from
+  - the model's layout: its engines' roles and GPUs known, and the idle gate OPEN for every GPU the layout evicts from. A model may list
+    several layouts (`layouts`, in order of preference; `layout` alone is a list of one): the first that is ready is used, so
+    [RX 6600 layout, RX 6750 XT layout] prefers the 6600 and falls back to the 6750 when only that gate is open. A layout that evicts
+    the coordinator (Computer then answers from the Courage-lite stand-in) additionally needs ALL of: `allow_coordinator_layouts` true
+    (default false), the layout's stand-in configured AND its eval passed (`engine_stand_ins.<name>.eval_passed`), and no takeback
+    cooldown (below)
   - an opening-length estimate >= min_window_min (below)
 
 Opening-length estimate: every gate opening (open -> close) is recorded per GPU. For the opening that is open now, with age A: take the
@@ -27,6 +31,15 @@ Inside the window, sessions run one after another, round robin over the resident
 (`max_seconds`) and, when the model's speed is known (models.<m>.tok_s, else measured from earlier sessions), a generated-token cap
 that fits the time left.
 
+Takeback (2026-10-13): every garden lease is acquired with yield_to_computer. The platform's takeback (stonesage/courage/takeback.py) can
+take a coordinator-evicting lease back at any moment: Computer on the stand-in fails or needs the full brain, or a person starts using
+the cockpit (stonesage/activity.py; also a shared reason of the idle gate, so the garden neither starts nor keeps running meanwhile).
+It calls `yield_to_computer(why, cooldown_s)` (registered through the `register_yielder` service; this module imports nothing of the
+platform's courage code): the running session is stopped at once (the worker saves the draft, reason "takeback: <why>") and the next
+tick ends the window; the takeback releases the lease itself and waits for the coordinator. After a takeback no coordinator-evicting layout
+is taken for `courage.takeback.cooldown_min` (default 60; the platform's `takeback_cooldown`). Layouts that leave the coordinator alone are
+not affected by the cooldown.
+
 Preemption (polled every running_poll_s): an approval appears, Computer gets a turn after the window began, the gate closes (its
 shared reasons: approvals, a Computer turn, somebody awake; the per-GPU reasons are ignored while the lease is held, because our own
 session is what makes the card busy and the lent-out engine is not scraped), the lease is lost, or the schedule is switched off:
@@ -34,7 +47,9 @@ the session is stopped at once (the worker saves the draft) and the lease releas
 
 CPU slot: a model with layout null and a `unit` (e.g. the Courage-lite stand-in's unit) is started on demand when `schedule.cpu_enabled`
 is true (default FALSE) and no lease is held and the house gate is open; a lease that appears wins at once (the session stops; the unit
-is left alone while a lease is held, because the lease may be using it as the stand-in).
+is left alone while a lease is held, because the lease may be using it as the stand-in). The CPU slot and the stand-in are the same engine (:8006
+in the usual setup), so a CPU session never starts while Computer is on the stand-in (a lease is held or `lease.brain()` says lite), and one
+that is running ends when a lease appears: the lease wins.
 
 Every start, preemption and release is traced as kind "garden"; skips are traced at most once per reason per skip_trace_s.
 Status: GET /api/garden/schedule; Prometheus gauges from metrics().
@@ -86,6 +101,16 @@ ACTION_PREEMPT = "preempted"
 
 def _hhmm(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
+
+
+def layout_choices(spec: Dict[str, Any]) -> List[str]:
+    """The engine layouts a model can run in, in order of preference: `layouts` (a list), else `layout` alone. [] = the CPU slot."""
+    many = spec.get("layouts")
+    if isinstance(many, list):
+        out = [str(x) for x in many if x]
+        if out:
+            return out
+    return [str(spec["layout"])] if spec.get("layout") else []
 
 
 # ---- the gate's history ---------------------------------------------------------------------------------------------------
@@ -283,10 +308,16 @@ class GardenScheduler:
                  active: Any, last_turn_fn: Callable[[], Optional[float]], pending_fn: Callable[[], int],
                  trace: Optional[Callable[[Dict[str, Any]], None]] = None, data_dir: Optional[str] = None,
                  systemctl: Optional[Callable[[str, str], Dict[str, Any]]] = None, http_ok: Optional[Callable[[str], bool]] = None,
-                 clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep):
+                 clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
+                 takeback_cooldown_fn: Optional[Callable[[], float]] = None,
+                 takeback_status_fn: Optional[Callable[[], Dict[str, Any]]] = None):
         """gate_fn(fresh) -> idle_gate.check(); lease: engine_lease.EngineLease (.lease, .layout_info, .acquire, .release);
         worker: garden_client.GardenClient (.health, .residents, .start_session(body, by=), .stop_session, .session);
-        active: garden_client.ActiveEngine; last_turn_fn() -> time of Computer's last turn; pending_fn() -> approvals waiting."""
+        active: garden_client.ActiveEngine; last_turn_fn() -> time of Computer's last turn; pending_fn() -> approvals waiting;
+        takeback_cooldown_fn() -> seconds until a coordinator-evicting layout may be borrowed again; takeback_status_fn() -> the last takeback."""
+        self.takeback_cooldown_fn, self.takeback_status_fn = takeback_cooldown_fn, takeback_status_fn
+        self.yield_request: Optional[Dict[str, Any]] = None
+        self.takeback_until = 0.0
         self.cfg_fn, self.gate_fn, self.lease, self.worker, self.active = cfg_fn, gate_fn, lease, worker, active
         self.last_turn_fn, self.pending_fn, self.trace = last_turn_fn, pending_fn, trace
         self.systemctl, self.http_ok, self.clock, self.sleep = systemctl, http_ok, clock, sleep
@@ -407,16 +438,38 @@ class GardenScheduler:
         if not spec:
             return False, "model %r is not in garden.models" % name, {}
         shared = self._shared(gate)
-        if not spec.get("layout"):                                   # the CPU slot
+        if not layout_choices(spec):                                 # the CPU slot
             if not cfg["cpu_enabled"]:
                 return False, "the CPU slot is switched off (schedule.cpu_enabled)", {}
             if not spec.get("unit") or not spec.get("engine_url"):
                 return False, "model %r needs unit and engine_url for the CPU slot" % name, {}
+            on_stand_in = self._on_stand_in()
+            if on_stand_in:                                          # same engine as Computer's spare brain: the lease wins
+                return False, on_stand_in, {}
             if shared:
                 return False, "the house gate is closed: " + "; ".join(shared[:3]), {}
             est = self.estimate(HOUSE, now)
             return self._with_estimate(est, cfg, {"kind": "cpu", "unit": spec["unit"], "gpus": [HOUSE]}, "the house gate")
-        layout = spec["layout"]
+        why: List[str] = []
+        for layout in layout_choices(spec):                           # in the order of preference
+            ok, reason, plan = self._layout_ready(layout, cfg, gate, now)
+            if ok:
+                return True, "", plan
+            why.append(reason)
+        return False, "; ".join(why)[:300], {}
+
+    def takeback_left(self) -> float:
+        """Seconds until a coordinator-evicting layout may be borrowed again after a takeback."""
+        left = self.takeback_until - self.clock()
+        if self.takeback_cooldown_fn:
+            try:
+                left = max(left, float(self.takeback_cooldown_fn() or 0.0))
+            except Exception:
+                pass
+        return max(0.0, left)
+
+    def _layout_ready(self, layout: str, cfg: Dict[str, Any], gate: Dict[str, Any], now: float) -> Tuple[bool, str, Dict[str, Any]]:
+        shared = self._shared(gate)
         info = self.lease.layout_info(layout) if hasattr(self.lease, "layout_info") else None
         if not info:
             return False, "layout %r is not in engine_layouts" % layout, {}
@@ -424,8 +477,15 @@ class GardenScheduler:
             return False, "layout %s is disabled: %s" % (layout, info["disabled"]), {}
         if not info.get("resolved") or not info.get("gpus"):
             return False, "layout %s: its engines' roles or GPUs are not known right now" % layout, {}
-        if COORDINATOR_ROLE in (info.get("roles") or []) and not cfg["allow_coordinator_layouts"]:
-            return False, "layout %s would take Computer's coordinator (schedule.allow_coordinator_layouts is false)" % layout, {}
+        if COORDINATOR_ROLE in (info.get("roles") or []):
+            if not cfg["allow_coordinator_layouts"]:
+                return False, "layout %s would take Computer's coordinator (schedule.allow_coordinator_layouts is false)" % layout, {}
+            if not info.get("stand_in_ready"):
+                return False, ("layout %s would take Computer's coordinator and its stand-in is not ready (engine_stand_ins "
+                               "eval_passed is not set, or the layout names none)" % layout), {}
+            left = self.takeback_left()
+            if left > 0:
+                return False, "layout %s: Computer took the coordinator back; not again for %d min" % (layout, round(left / 60)), {}
         closed = []
         for gpu in info["gpus"]:
             g = (gate.get("gpus") or {}).get(gpu)
@@ -438,6 +498,20 @@ class GardenScheduler:
             return False, "no opening recorded yet for %s" % ", ".join(info["gpus"]), {}
         est = min(ests, key=lambda e: e["seconds"])
         return self._with_estimate(est, cfg, {"kind": "lease", "layout": layout, "gpus": list(info["gpus"])}, "the gate")
+
+    def _on_stand_in(self) -> Optional[str]:
+        """Why the CPU slot is not ours: Computer is on the stand-in (it shares the CPU engine), or a lease is held. None = free."""
+        held = getattr(self.lease, "lease", None)
+        if held:
+            return "an engine lease is held (%s): Computer may be on the stand-in, which is the CPU slot" % held.get("layout")
+        brain = getattr(self.lease, "brain", None)
+        try:
+            b = brain(COORDINATOR_ROLE) if callable(brain) else None
+        except Exception:
+            b = None
+        if b and b.get("mode") == "lite":
+            return "Computer is on the spare brain, which is the CPU slot"
+        return None
 
     def _with_estimate(self, est: Optional[Dict[str, Any]], cfg: Dict[str, Any], base: Dict[str, Any], what: str):
         if not est:
@@ -456,6 +530,7 @@ class GardenScheduler:
         return None
 
     def _maybe_start(self, cfg: Dict[str, Any], gate: Dict[str, Any], now: float) -> None:
+        self.yield_request = None                  # a takeback that arrived with no window open has nothing left to end
         if self.state == "preempted" and now >= self.cooldown_until:
             self.state = "waiting"
         if now < self.cooldown_until:
@@ -516,7 +591,8 @@ class GardenScheduler:
         try:
             if plan["kind"] == "lease":
                 ttl = usable_s + float(cfg["margin_min"]) * 60
-                res = self.lease.acquire(plan["layout"], ttl, reason="garden: scheduled session (%s)" % model, approver="garden-scheduler")
+                res = self.lease.acquire(plan["layout"], ttl, reason="garden: scheduled session (%s)" % model, approver="garden-scheduler",
+                                         yield_to_computer=True)
                 if not res.get("ok"):
                     self.retry_until = now + float(cfg["retry_s"])
                     self._skip("the lease was refused: %s" % str(res.get("error"))[:160])
@@ -598,6 +674,10 @@ class GardenScheduler:
     def _supervise(self, cfg: Dict[str, Any], gate: Dict[str, Any], now: float) -> None:
         w = self.window
         held = getattr(self.lease, "lease", None)
+        if self.yield_request:                                  # Computer took the GPU back (yield_to_computer): the session is stopped
+            why = self.yield_request["why"]
+            self.yield_request = None
+            return self._end_window(why, preempted=True, own=False, release=False)
         if w["kind"] == "lease" and (not held or held.get("id") != w["lease_id"]):
             return self._end_window("the lease is gone", preempted=True, own=False, release=False)
         if w["kind"] == "cpu" and held:
@@ -634,11 +714,36 @@ class GardenScheduler:
             if not self._start_session(cfg):
                 return self._end_window("no time or no resident left in the window", preempted=False, own=True)
 
+    def yield_to_computer(self, why: str, cooldown_s: float = 0.0) -> Dict[str, Any]:
+        """Computer takes the GPU back (the platform's takeback calls this from any thread; it registered through `register_yielder`).
+        Stops the running session at once, so the worker saves the draft (reason = `why`, e.g. "takeback: tool"), and asks the next tick to
+        end the window. The takeback releases the lease itself. Starts the cooldown for coordinator-evicting layouts."""
+        if cooldown_s:
+            self.takeback_until = max(self.takeback_until, self.clock() + float(cooldown_s))
+        w = self.window
+        if not w and not self.starting:
+            return {"ok": True, "stopped": False, "note": "no garden window"}
+        self.yield_request = {"why": str(why)[:200], "at": self.clock()}
+        sid = (w or {}).get("session")
+        stopped = False
+        if sid:
+            try:
+                out = self.worker.stop_session(sid, str(why)[:200])         # the draft is kept with this reason: "takeback: <why>"
+                self.sessions.ended(sid, (out or {}).get("tokens") or 0, "preempted: " + why)
+                w["stopped_by_takeback"] = sid
+                stopped = True
+            except Exception as e:
+                logger.warning("garden scheduler: takeback stop failed: %s", e)
+            self.active.clear(sid)
+        return {"ok": True, "stopped": stopped, "session": sid}
+
     def _end_window(self, reason: str, preempted: bool, own: bool, release: bool = True) -> None:
         w = self.window
         if not w:
             return
         sid = w.get("session")
+        if sid and w.get("stopped_by_takeback") == sid:
+            sid = None                                          # already stopped (and logged) by yield_to_computer
         if sid:
             try:
                 out = self.worker.stop_session(sid, ("garden scheduler: " + reason)[:200])
@@ -689,6 +794,7 @@ class GardenScheduler:
                             "lease_until": _hhmm(w["expires"]) if w.get("expires") else None, "resident": w.get("resident"),
                             "session": w.get("session"), "sessions": w["sessions"]} if w else None),
                 "cooldown_until": self.cooldown_until if self.cooldown_until > now else None,
+                "takeback": self._takeback_status(),
                 "sessions_24h": sessions_24h,
                 "budgets": {"max_sessions_24h": cfg["max_sessions_24h"], "max_tokens_hour": cfg["max_tokens_hour"]},
                 "cpu_enabled": bool(cfg["cpu_enabled"]), "allow_coordinator_layouts": bool(cfg["allow_coordinator_layouts"]),
@@ -696,6 +802,17 @@ class GardenScheduler:
                 "assignments": {rid: str(r.get("model") or "") for rid, r in (section(self.cfg_fn() or {}).get("residents") or {}).items()
                                 if isinstance(r, dict)},
                 "history": {gpu: len(self.history.lengths(gpu)) for gpu in set(self.history.closed) | set(gates)}}
+
+    def _takeback_status(self) -> Dict[str, Any]:
+        """The last takeback (what the platform recorded) and how long coordinator-evicting layouts stay off the table."""
+        last = None
+        if self.takeback_status_fn:
+            try:
+                last = (self.takeback_status_fn() or {}).get("last")
+            except Exception:
+                last = None
+        left = self.takeback_left()
+        return {"last": last, "coordinator_layouts_blocked_for_s": round(left) if left > 0 else 0}
 
     def metrics(self) -> List[str]:
         enabled = 1 if self.cfg()["enabled"] else 0

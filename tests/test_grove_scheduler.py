@@ -25,9 +25,10 @@ GPU = "RX 6600"
 OTHER = "RX 6750 XT"
 LAYOUTS = {
     "longctx_6600": {"layout": "longctx_6600", "roles": ["vision"], "gpus": [GPU], "resolved": True, "disabled": None},
-    "longctx_6750": {"layout": "longctx_6750", "roles": ["coordinator", "worker"], "gpus": [OTHER], "resolved": True, "disabled": None},
+    "longctx_6750": {"layout": "longctx_6750", "roles": ["coordinator", "worker"], "gpus": [OTHER], "resolved": True, "disabled": None,
+                       "stand_in_ready": True},
     "longctx_max": {"layout": "longctx_max", "roles": ["coordinator", "worker", "vision"], "gpus": [OTHER, GPU], "resolved": True,
-                    "disabled": None},
+                    "disabled": None, "stand_in_ready": True},
     "unresolved": {"layout": "unresolved", "roles": [], "gpus": [], "resolved": False, "disabled": None},
 }
 
@@ -55,11 +56,12 @@ class FakeLease:
     def layout_info(self, layout):
         return LAYOUTS.get(layout)
 
-    def acquire(self, layout, ttl_s=3600, reason="", approver="", force=False):
+    def acquire(self, layout, ttl_s=3600, reason="", approver="", force=False, yield_to_computer=False):
         if self.refuse:
             return {"ok": False, "error": self.refuse}
         expires = self.clock() + ttl_s
-        self.acquired.append({"layout": layout, "ttl_s": ttl_s, "at": self.clock(), "approver": approver, "force": force, "reason": reason})
+        self.acquired.append({"layout": layout, "ttl_s": ttl_s, "at": self.clock(), "approver": approver, "force": force, "reason": reason,
+                              "yield_to_computer": yield_to_computer})
         self.lease = {"id": "L1", "layout": layout, "expires": expires, "state": "active"}
         return {"ok": True, "lease_id": "L1", "expires": expires, "url": "http://engine:8005", "until": "x"}
 

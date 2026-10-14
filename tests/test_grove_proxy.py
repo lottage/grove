@@ -269,6 +269,8 @@ class ClientTests(unittest.TestCase):
                 return 200, {"ok": True, "session": "20261013T120000Z-ab12", "resident": body["resident"]}
             if path.endswith("/stop"):
                 return 200, {"ok": True, "ended": True}
+            if method == "GET" and path.startswith("/sessions/20261013T120000Z-ab12"):
+                return 200, {"ok": True, "session": "20261013T120000Z-ab12", "state": "ended", "reason": "rest", "turns": 4, "tokens": 310}
             return 404, {"ok": False, "error": "not found"}
 
         self.worker = _Serve(worker)
@@ -312,6 +314,19 @@ class ClientTests(unittest.TestCase):
         self.assertEqual((rec["kind"], rec["outcome"]), ("garden", "stopped"))
         status, _h, _p = call_full("POST", "/api/garden/sessions/..%2Fx/stop", {})
         self.assertIn(status, (400, 404))
+
+    def test_a_finished_session_reads_back_through_stonesage(self):
+        """2026-10-13 (rc.5 dry run): StoneSage had no GET route for a session, so every status read was a 404. Now it is passed to
+        the worker, which answers for a finished session from its transcript's end record."""
+        status, _h, payload = call_full("GET", "/api/garden/sessions/20261013T120000Z-ab12")
+        self.assertEqual(status, 200, payload)
+        out = json.loads(payload)
+        self.assertEqual((out["state"], out["reason"], out["turns"], out["tokens"]), ("ended", "rest", 4, 310))
+        self.assertEqual(self.worker.requests[-1]["method"], "GET")
+        self.assertEqual(self.worker.requests[-1]["path"], "/sessions/20261013T120000Z-ab12")
+        self.assertEqual(call_full("GET", "/api/garden/sessions/20261013T120000Z-ab12")[0], 200)
+        self.assertIn(call_full("GET", "/api/garden/sessions/..%2Fx")[0], (400, 404))
+        self.assertEqual(call_full("GET", "/api/garden/sessions/20261013T120000Z-ab12", auth=False)[0], 401)
 
     def test_a_worker_that_is_down_is_a_502_not_a_crash(self):
         with mock.patch.dict(server.config, {"garden": {"worker_url": "http://127.0.0.1:1", "control_key": CONTROL_KEY}}):

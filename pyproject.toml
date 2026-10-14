@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grove"
-version = "0.1.0rc5"
+version = "0.1.0rc6"
 description = "Optional add-on app for StoneSage: residents who write, search and read with no task, kept as a research record."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Unlicense"
 license-files = ["LICENSE"]
 dependencies = [
-  "lodestone @ git+https://github.com/lottage/lodestone@v0.1.0-rc.5",
-  "stonesage @ git+https://github.com/lottage/stonesage@v0.1.0-rc.5"
+  "lodestone @ git+https://github.com/lottage/lodestone@v0.1.0-rc.6",
+  "stonesage @ git+https://github.com/lottage/stonesage@v0.1.0-rc.6"
 ]
 
 [project.urls]

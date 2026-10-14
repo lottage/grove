@@ -740,6 +740,24 @@ class HttpTests(Base):
         self.assertEqual({p["kind"] for p in board["posts"]}, {"journal", "session"})
         self.assertEqual(self.req("GET", "/health")[1]["residents"], ["resident-1"])
 
+    def test_a_finished_session_still_reads_back_after_the_worker_forgets_it(self):
+        """2026-10-13 (rc.5 dry run): GET /sessions/<id> answered 404 once a session had ended. The status comes from the transcript's
+        end record, so a finished session reads back whether or not this worker still holds it in memory (after a restart)."""
+        status, out = self.req("POST", "/sessions/start", {"resident": "resident-1", "model": "tiny", "model_sha256": SHA})
+        self.assertEqual(status, 200, out)
+        sid = out["session"]
+        self.assertTrue(self.garden.sessions[sid].wait(10))
+        end = next(r for r in reversed(self.store.read_transcript("resident-1", sid)) if r.get("type") == "end")
+        status, info = self.req("GET", "/sessions/" + sid)
+        self.assertEqual(status, 200, info)
+        self.assertEqual((info["state"], info["reason"], info["turns"], info["tokens"]), ("ended", "rest", end["turns"], end["tokens"]))
+        self.garden.sessions.clear()                      # the worker restarted: nothing in memory any more
+        status, after = self.req("GET", "/sessions/" + sid)
+        self.assertEqual(status, 200, after)
+        self.assertEqual((after["state"], after["reason"], after["turns"], after["tokens"], after["ended"] is not None),
+                         ("ended", "rest", end["turns"], end["tokens"], True))
+        self.assertEqual(self.req("GET", "/sessions/20990101T000000Z-ffff")[0], 404)
+
     def test_bad_start_requests(self):
         for body in ({"model": "m"}, {"resident": "Bad Id", "model": "m"}, {"resident": "ok"}, {"resident": "ok", "model": "m", "model_sha256": "xyz"},
                      {"resident": "ok", "model": "m", "seed": "1"}):

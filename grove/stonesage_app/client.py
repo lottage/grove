@@ -478,7 +478,11 @@ def install(ctx, client: Optional[GardenClient] = None, proxy_opener: Optional[C
                 cfg_fn, lambda fresh: get_gate().check(fresh=fresh), _LazyLease(get_lease), client, active,
                 ctx.services.get("last_courage_turn") or (lambda: None), ctx.services.get("pending_approvals") or (lambda: 0),
                 trace=write_trace, data_dir=ctx.data_dir(), systemctl=ctx.services.get("lease_systemctl"),
-                http_ok=ctx.services.get("http_ok"))
+                http_ok=ctx.services.get("http_ok"), takeback_cooldown_fn=ctx.services.get("takeback_cooldown"),
+                takeback_status_fn=ctx.services.get("takeback_status"))
+            register_yielder = ctx.services.get("register_yielder")       # Computer may take a borrowed coordinator back (platform takeback)
+            if callable(register_yielder):
+                register_yielder(scheduler.yield_to_computer)
             ctx.on_start(scheduler.start)     # always runs once the garden is configured: it records gate history; it acts only if enabled
     if feeder is None:
         from . import window as garden_window
@@ -585,6 +589,20 @@ def install(ctx, client: Optional[GardenClient] = None, proxy_opener: Optional[C
             return
         trace("stop", "stopped", session=m.group(1), reason=reason, ended=bool(out.get("ended")))
         auth.reply(h, 200, out)
+
+    def session_status(h, parsed, body):
+        """GET /api/garden/sessions/<id>[?transcript=1]: a session's status, live or ended (the worker reads the end record from the
+        transcript, so a finished one still answers). Read-only; the worker's own 404 says the id is unknown."""
+        if not owner_only(h):
+            return
+        m = re.match(r"^/api/garden/sessions/([^/]+)$", parsed.path)
+        if not m:
+            auth.reply(h, 404, {"ok": False, "error": "not found"})
+            return
+        try:
+            auth.reply(h, 200, client.session(m.group(1)))
+        except GardenError as e:
+            failure(h, e)
 
     def status(h, parsed, body):
         if not owner_only(h):
@@ -802,3 +820,4 @@ def install(ctx, client: Optional[GardenClient] = None, proxy_opener: Optional[C
     ctx.routes.add("GET", "/api/garden/board", board, owner=OWNER)
     ctx.routes.add("POST", "/api/garden/sessions/start", start, owner=OWNER)
     ctx.routes.add("POST", "/api/garden/sessions/", stop, prefix=True, owner=OWNER)
+    ctx.routes.add("GET", "/api/garden/sessions/", session_status, prefix=True, owner=OWNER)
